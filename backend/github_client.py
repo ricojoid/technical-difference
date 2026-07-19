@@ -1,3 +1,4 @@
+import os
 import httpx
 from typing import List, Dict, Any, Optional
 
@@ -121,8 +122,6 @@ class GitHubClient:
                 continue
                 
             if item_type == "blob":
-                # Check extension
-                import os
                 _, ext = os.path.splitext(path.lower())
                 if ext in ignored_extensions:
                     continue

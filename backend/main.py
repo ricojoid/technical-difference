@@ -1,4 +1,5 @@
 import os
+import re
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,21 +9,30 @@ from dotenv import load_dotenv
 from github_client import GitHubClient
 from reviewer import CodeReviewer, compare_database_schemas
 
-# Load environment variables from .env if present
+ENTRY_POINT_PATTERNS = [
+    r'(^|/)main\.(py|go|ts|js|tsx|jsx|rs)$',
+    r'(^|/)app\.(py|ts|js|tsx|jsx)$',
+    r'(^|/)index\.(ts|js|tsx|jsx)$',
+    r'(^|/)server\.(py|ts|js)$',
+    r'(^|/)manage\.py$',
+    r'(^|/)routes\.(py|ts|js)$',
+    r'(^|/)router\.(py|ts|js)$',
+]
+
 load_dotenv()
 
 app = FastAPI(title="GitHub Code Reviewer API")
 
-# Enable CORS for frontend development server
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust in production
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pydantic schemas for requests
 class ReviewRequest(BaseModel):
     owner: str
     repo: str
@@ -44,16 +54,24 @@ class DbCompareRequest(BaseModel):
     name_a: Optional[str] = "Database A (DEV)"
     name_b: Optional[str] = "Database B (PROD)"
 
+def _resolve_token(header_val: Optional[str]) -> Optional[str]:
+    if header_val and header_val not in ("null", "undefined", ""):
+        return header_val
+    return os.getenv("GITHUB_TOKEN")
+
+def _resolve_ai_key(header_val: Optional[str]) -> Optional[str]:
+    if header_val and header_val not in ("null", "undefined", ""):
+        return header_val
+    return os.getenv("AI_API_KEY")
+
 @app.get("/api/status")
 async def get_status():
-    """Get backend status and configuration info."""
     ai_key = os.getenv("AI_API_KEY")
-    has_ai_key = ai_key is not None and ai_key.lower() not in ("null", "undefined", "")
+    has_ai_key = bool(ai_key and ai_key.lower() not in ("null", "undefined", ""))
     return {
         "status": "online",
         "has_ai_key": has_ai_key,
         "model": os.getenv("AI_MODEL", "openai/Qwen3.6-35B"),
-        "gateway_url": os.getenv("AI_GATEWAY_URL", "https://gateway.codepilot.my.id/v1")
     }
 
 @app.get("/api/repos")
@@ -61,29 +79,23 @@ async def get_repos(
     username: Optional[str] = Query(None),
     x_github_token: Optional[str] = Header(None)
 ):
-    """Retrieve repositories for the authenticated user or a public user/org."""
-    token = x_github_token
-    
-    # If no token in header, check environment
-    if not token or token == "null" or token == "undefined":
-        token = os.getenv("GITHUB_TOKEN")
-        
+    token = _resolve_token(x_github_token)
     client = GitHubClient(token=token)
-    
+
     try:
         if token:
-            # Fetch authenticated user's repos (including private)
             return await client.get_user_repos()
         elif username:
-            # Fetch public repos for username
             return await client.get_public_repos(username)
         else:
             raise HTTPException(
                 status_code=400,
-                detail="Either GitHub Token header (X-GitHub-Token) or username query parameter must be provided."
+                detail="Either GitHub Token header or username query parameter must be provided."
             )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to fetch repositories.")
 
 @app.get("/api/repos/{owner}/{repo}/branches")
 async def get_branches(
@@ -91,16 +103,11 @@ async def get_branches(
     repo: str,
     x_github_token: Optional[str] = Header(None)
 ):
-    """Fetch branches list for a repository."""
-    token = x_github_token
-    if not token or token == "null" or token == "undefined":
-        token = os.getenv("GITHUB_TOKEN")
-        
-    client = GitHubClient(token=token)
+    client = GitHubClient(token=_resolve_token(x_github_token))
     try:
         return await client.get_branches(owner, repo)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to fetch branches.")
 
 @app.get("/api/repos/{owner}/{repo}/tree")
 async def get_repo_tree(
@@ -109,16 +116,11 @@ async def get_repo_tree(
     branch: str = Query("main"),
     x_github_token: Optional[str] = Header(None)
 ):
-    """Fetch files list in the repository tree recursively."""
-    token = x_github_token
-    if not token or token == "null" or token == "undefined":
-        token = os.getenv("GITHUB_TOKEN")
-        
-    client = GitHubClient(token=token)
+    client = GitHubClient(token=_resolve_token(x_github_token))
     try:
         return await client.get_repo_tree(owner, repo, branch)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to fetch repository tree.")
 
 @app.get("/api/repos/{owner}/{repo}/content")
 async def get_file_content(
@@ -128,40 +130,27 @@ async def get_file_content(
     branch: str = Query("main"),
     x_github_token: Optional[str] = Header(None)
 ):
-    """Fetch raw file content from GitHub repository."""
-    token = x_github_token
-    if not token or token == "null" or token == "undefined":
-        token = os.getenv("GITHUB_TOKEN")
-        
-    client = GitHubClient(token=token)
+    client = GitHubClient(token=_resolve_token(x_github_token))
     try:
         content = await client.get_file_content(owner, repo, branch, path)
         return {"content": content}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to fetch file content.")
 
 @app.post("/api/review")
 async def review_repository(
     request: ReviewRequest,
     x_github_token: Optional[str] = Header(None),
-    x_gemini_apikey: Optional[str] = Header(None)
+    x_ai_apikey: Optional[str] = Header(None)
 ):
-    """Review files in a repository and return comments."""
-    token = x_github_token
-    if not token or token == "null" or token == "undefined":
-        token = os.getenv("GITHUB_TOKEN")
-        
-    gemini_key = x_gemini_apikey
-    if not gemini_key or gemini_key == "null" or gemini_key == "undefined":
-        gemini_key = os.getenv("GEMINI_API_KEY")
+    token = _resolve_token(x_github_token)
+    ai_key = _resolve_ai_key(x_ai_apikey)
 
     client = GitHubClient(token=token)
-    reviewer = CodeReviewer(api_key=gemini_key)
+    reviewer = CodeReviewer(api_key=ai_key)
     
     results = []
-    files_to_review = request.files
-    
-    for file_path in files_to_review:
+    for file_path in request.files:
         try:
             content = await client.get_file_content(request.owner, request.repo, request.branch, file_path)
             review_result = await reviewer.review_file(file_path, content)
@@ -186,7 +175,6 @@ async def review_repository(
     }
 
 def get_infrastructure_files(tree: List[Dict[str, Any]]) -> List[str]:
-    # Key infrastructure and build config file patterns
     patterns = [
         r'(^|/)package\.json$',
         r'(^|/)requirements\.txt$',
@@ -201,64 +189,50 @@ def get_infrastructure_files(tree: List[Dict[str, Any]]) -> List[str]:
         r'(^|/)composer\.json$',
         r'(^|/)cargo\.toml$'
     ]
-    import re
     matches = []
     for item in tree:
         path = item.get("path", "")
-        # Check if the path matches any of the patterns
         for pattern in patterns:
             if re.search(pattern, path, re.IGNORECASE):
                 matches.append(path)
                 break
-    # Return all matched infrastructure configuration files without limit
     return matches
 
 @app.post("/api/compare")
 async def compare_repositories(
     request: CompareRequest,
     x_github_token: Optional[str] = Header(None),
-    x_gemini_apikey: Optional[str] = Header(None)
+    x_ai_apikey: Optional[str] = Header(None)
 ):
-    """Compare two repositories or branches."""
-    token = x_github_token
-    if not token or token == "null" or token == "undefined":
-        token = os.getenv("GITHUB_TOKEN")
-        
-    gemini_key = x_gemini_apikey
-    if not gemini_key or gemini_key == "null" or gemini_key == "undefined":
-        gemini_key = os.getenv("GEMINI_API_KEY")
+    token = _resolve_token(x_github_token)
+    ai_key = _resolve_ai_key(x_ai_apikey)
 
     client = GitHubClient(token=token)
-    reviewer = CodeReviewer(api_key=gemini_key)
+    reviewer = CodeReviewer(api_key=ai_key)
 
     try:
-        # Fetch file trees for both repos
         tree_a = await client.get_repo_tree(request.repo_a.owner, request.repo_a.repo, request.repo_a.branch)
         tree_b = await client.get_repo_tree(request.repo_b.owner, request.repo_b.repo, request.repo_b.branch)
         
-        # Scan for config files in both trees
         config_paths_a = get_infrastructure_files(tree_a)
         config_paths_b = get_infrastructure_files(tree_b)
         
-        # Fetch content for config files in Repo A
         config_files_a = []
         for path in config_paths_a:
             try:
                 content = await client.get_file_content(request.repo_a.owner, request.repo_a.repo, request.repo_a.branch, path)
                 config_files_a.append({"path": path, "content": content})
-            except Exception as e:
-                print(f"Failed to fetch config file content for {path} in Repo A: {e}")
+            except Exception:
+                pass
                 
-        # Fetch content for config files in Repo B
         config_files_b = []
         for path in config_paths_b:
             try:
                 content = await client.get_file_content(request.repo_b.owner, request.repo_b.repo, request.repo_b.branch, path)
                 config_files_b.append({"path": path, "content": content})
-            except Exception as e:
-                print(f"Failed to fetch config file content for {path} in Repo B: {e}")
+            except Exception:
+                pass
                 
-        # Scan for modified files (shared files with different sha)
         files_dict_a = {f["path"]: f for f in tree_a}
         files_dict_b = {f["path"]: f for f in tree_b}
         shared_paths = set(files_dict_a.keys()) & set(files_dict_b.keys())
@@ -271,12 +245,11 @@ async def compare_repositories(
                 if f_a.get("sha") != f_b.get("sha"):
                     modified_files.append(path)
                     
-        # Select up to 3 modified code files to compare in-depth
         code_extensions = {".py", ".js", ".ts", ".tsx", ".go", ".java", ".cpp", ".c", ".h", ".cs", ".php", ".rb"}
         modified_code_paths = [
             p for p in modified_files 
             if os.path.splitext(p.lower())[1] in code_extensions
-        ][:3]
+        ][:5]
         
         modified_files_content = []
         for path in modified_code_paths:
@@ -288,13 +261,41 @@ async def compare_repositories(
                     "content_a": content_a,
                     "content_b": content_b
                 })
-            except Exception as e:
-                print(f"Failed to fetch content for modified file {path}: {e}")
+            except Exception:
+                pass
+
+        def _find_entry_points(tree_files):
+            paths = []
+            for item in tree_files:
+                p = item.get("path", "")
+                for pattern in ENTRY_POINT_PATTERNS:
+                    if re.search(pattern, p, re.IGNORECASE):
+                        paths.append(p)
+                        break
+            return paths[:8]
+
+        entry_paths_a = _find_entry_points(tree_a)
+        entry_paths_b = _find_entry_points(tree_b)
+
+        entry_files_a = []
+        for path in entry_paths_a:
+            try:
+                content = await client.get_file_content(request.repo_a.owner, request.repo_a.repo, request.repo_a.branch, path)
+                entry_files_a.append({"path": path, "content": content})
+            except Exception:
+                pass
+
+        entry_files_b = []
+        for path in entry_paths_b:
+            try:
+                content = await client.get_file_content(request.repo_b.owner, request.repo_b.repo, request.repo_b.branch, path)
+                entry_files_b.append({"path": path, "content": content})
+            except Exception:
+                pass
                 
         repo_a_fullname = f"{request.repo_a.owner}/{request.repo_a.repo}:{request.repo_a.branch}"
         repo_b_fullname = f"{request.repo_b.owner}/{request.repo_b.repo}:{request.repo_b.branch}"
         
-        # Compare them
         comparison = await reviewer.compare_repositories(
             repo_a_files=tree_a,
             repo_b_files=tree_b,
@@ -302,15 +303,16 @@ async def compare_repositories(
             repo_b_name=repo_b_fullname,
             config_files_a=config_files_a,
             config_files_b=config_files_b,
-            modified_files_content=modified_files_content
+            modified_files_content=modified_files_content,
+            entry_point_files_a=entry_files_a,
+            entry_point_files_b=entry_files_b
         )
         return comparison
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to compare repositories.")
 
 @app.post("/api/compare-db")
 async def compare_db_schemas(request: DbCompareRequest):
-    """Compare two DDL database schemas and identify gaps."""
     try:
         res = compare_database_schemas(
             schema_a=request.schema_a,
@@ -319,8 +321,8 @@ async def compare_db_schemas(request: DbCompareRequest):
             name_b=request.name_b or "Database B (PROD)"
         )
         return res
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to compare database schemas.")
 
 if __name__ == "__main__":
     import uvicorn

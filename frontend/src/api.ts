@@ -1,4 +1,4 @@
-const BASE_URL = 'http://127.0.0.1:8000';
+const BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000';
 
 export interface Repository {
   id: number;
@@ -56,13 +56,6 @@ export interface CompareResponse {
   ai_comparison: string;
 }
 
-export interface DbCompareRequest {
-  schema_a: string;
-  schema_b: string;
-  name_a?: string;
-  name_b?: string;
-}
-
 export interface DbCompareResponse {
   tables_only_in_a: string[];
   tables_only_in_b: string[];
@@ -80,14 +73,14 @@ export interface DbCompareResponse {
 
 function getHeaders(): HeadersInit {
   const token = localStorage.getItem('github_token') || '';
-  const geminiKey = localStorage.getItem('gemini_api_key') || '';
+  const geminiKey = localStorage.getItem('ai_api_key') || '';
   
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
   
   if (token) headers['X-Github-Token'] = token;
-  if (geminiKey) headers['X-Gemini-Apikey'] = geminiKey;
+  if (geminiKey) headers['X-Ai-Apikey'] = geminiKey;
   
   return headers;
 }

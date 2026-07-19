@@ -41,7 +41,10 @@ import type {
   DbCompareResponse
 } from './api';
 
-// Helper to construct folder structure from flat file path array
+function errMsg(err: unknown): string {
+  return err instanceof Error ? errMsg(err) : 'An unexpected error occurred';
+}
+
 interface TreeNode {
   name: string;
   path: string;
@@ -55,7 +58,7 @@ export default function App() {
   
   // Configuration
   const [githubToken, setGithubToken] = useState(localStorage.getItem('github_token') || '');
-  const [geminiKey, setGeminiKey] = useState(localStorage.getItem('gemini_api_key') || '');
+  const [geminiKey, setGeminiKey] = useState(localStorage.getItem('ai_api_key') || '');
   const [showSettings, setShowSettings] = useState(false);
   const [usernameInput, setUsernameInput] = useState('');
   
@@ -109,8 +112,8 @@ export default function App() {
   const loadSampleDbSchemas = () => {
     setDbNameA('DEV_DB (SQL Server)');
     setDbNameB('PROD_DB (SQL Server)');
-    setSchemaA('mssql://sa:StrongPassword123@localhost:1433/dev_db');
-    setSchemaB('mssql://sa:StrongPassword123@localhost:1433/prod_db');
+    setSchemaA('mssql://user:password@localhost:1433/dev_db');
+    setSchemaB('mssql://user:password@localhost:1433/prod_db');
   };
 
   const handleDbCompare = async () => {
@@ -124,8 +127,8 @@ export default function App() {
     try {
       const res = await compareDatabases(schemaA, schemaB, dbNameA, dbNameB);
       setDbCompareResult(res);
-    } catch (err: any) {
-      setDbCompareError(err.message || 'Failed to compare database schemas.');
+    } catch (err: unknown) {
+      setDbCompareError(errMsg(err) || 'Failed to compare database schemas.');
     } finally {
       setDbComparing(false);
     }
@@ -140,13 +143,12 @@ export default function App() {
   // Save Settings
   const saveSettings = () => {
     localStorage.setItem('github_token', githubToken);
-    localStorage.setItem('gemini_api_key', geminiKey);
+    localStorage.setItem('ai_api_key', geminiKey);
     setShowSettings(false);
     loadRepos();
     checkStatus();
   };
 
-  // Load repositories and backend config on startup
   useEffect(() => {
     loadRepos();
     checkStatus();
@@ -156,7 +158,9 @@ export default function App() {
     try {
       const status = await fetchBackendStatus();
       setBackendStatus(status);
-    } catch (err) {}
+    } catch (err) {
+      console.error("Failed to fetch backend status", err);
+    }
   };
 
   const loadRepos = async () => {
@@ -169,8 +173,8 @@ export default function App() {
       if (loaded.length > 0 && !selectedRepo) {
         handleSelectRepo(loaded[0]);
       }
-    } catch (err: any) {
-      setReposError(err.message || 'Failed to load repositories');
+    } catch (err: unknown) {
+      setReposError(errMsg(err) || 'Failed to load repositories');
     } finally {
       setLoadingRepos(false);
     }
@@ -193,8 +197,8 @@ export default function App() {
       
       // Fetch Tree
       loadTree(repo.owner, repo.name, repo.default_branch);
-    } catch (err: any) {
-      setReposError(err.message || 'Error loading repository branches');
+    } catch (err: unknown) {
+      setReposError(errMsg(err) || 'Error loading repository branches');
     }
   };
 
@@ -208,8 +212,8 @@ export default function App() {
         .filter(f => f.type === 'dir' && !f.path.includes('/'))
         .map(f => f.path);
       setExpandedFolders(new Set(rootFolders));
-    } catch (err: any) {
-      setReviewError(`Failed to load file tree: ${err.message}`);
+    } catch (err: unknown) {
+      setReviewError(`Failed to load file tree: ${errMsg(err)}`);
     } finally {
       setLoadingTree(false);
     }
@@ -266,8 +270,8 @@ export default function App() {
     try {
       const content = await fetchFileContent(selectedRepo.owner, selectedRepo.name, path, selectedBranch);
       setViewedFileContent(content);
-    } catch (err: any) {
-      setViewedFileContent(`// Error loading file content: ${err.message}`);
+    } catch (err: unknown) {
+      setViewedFileContent(`// Error loading file content: ${errMsg(err)}`);
     } finally {
       setLoadingContent(false);
     }
@@ -294,8 +298,8 @@ export default function App() {
         const fileRev = result.results.find(r => r.file_path === selectedFileToView);
         setActiveFileReview(fileRev || null);
       }
-    } catch (err: any) {
-      setReviewError(err.message || 'Failed to complete code review');
+    } catch (err: unknown) {
+      setReviewError(errMsg(err) || 'Failed to complete code review');
     } finally {
       setReviewing(false);
     }
@@ -308,7 +312,9 @@ export default function App() {
     try {
       const bList = await fetchBranches(repo.owner, repo.name);
       setBranchesA(bList);
-    } catch (err) {}
+    } catch (err) {
+      console.error("Failed to fetch branches for Repo A", err);
+    }
   };
 
   const handleSelectRepoB = async (repo: Repository) => {
@@ -317,7 +323,9 @@ export default function App() {
     try {
       const bList = await fetchBranches(repo.owner, repo.name);
       setBranchesB(bList);
-    } catch (err) {}
+    } catch (err) {
+      console.error("Failed to fetch branches for Repo B", err);
+    }
   };
 
   // Compare repos
@@ -332,8 +340,8 @@ export default function App() {
         selectedRepoB.owner, selectedRepoB.name, selectedBranchB
       );
       setCompareResult(result);
-    } catch (err: any) {
-      setCompareError(err.message || 'Failed to compare repositories');
+    } catch (err: unknown) {
+      setCompareError(errMsg(err) || 'Failed to compare repositories');
     } finally {
       setComparing(false);
     }
@@ -530,7 +538,7 @@ export default function App() {
               </div>
               
               <div className="form-group">
-                <label className="input-label">AI Gateway / Gemini API Key</label>
+                <label className="input-label">AI API Key</label>
                 <input 
                   type="password" 
                   className="input-field" 
@@ -612,8 +620,8 @@ export default function App() {
               filteredRepos.map(repo => (
                 <div 
                   key={repo.id}
-                  className={`repo-item ${selectedRepo?.id === repo.id ? 'selected' : ''}`}
-                  onClick={() => activeTab === 'review' ? handleSelectRepo(repo) : (selectedRepoA ? handleSelectRepoB(repo) : handleSelectRepoA(repo))}
+                  className={`repo-item ${selectedRepo?.id === repo.id || selectedRepoA?.id === repo.id || selectedRepoB?.id === repo.id ? 'selected' : ''}`}
+                  onClick={() => activeTab === 'review' ? handleSelectRepo(repo) : (!selectedRepoA ? handleSelectRepoA(repo) : !selectedRepoB ? handleSelectRepoB(repo) : null)}
                 >
                   <div className="repo-item-header">
                     <span className="repo-name" title={repo.full_name}>{repo.name}</span>

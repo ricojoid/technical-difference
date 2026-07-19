@@ -115,7 +115,9 @@ Guidelines:
                     raise Exception(f"AI Gateway returned status {response.status_code}: {response.text}")
                 
                 resp_json = response.json()
-                ai_text = resp_json["choices"][0]["message"]["content"]
+                ai_text = resp_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if not ai_text:
+                    raise Exception("Empty AI response")
                 
                 # Parse structured JSON review
                 review_data = self._parse_json_response(ai_text)
@@ -204,10 +206,12 @@ Guidelines:
                 indent = match.group(1)
                 if '\t' in indent:
                     tab_count += 1
-                elif indent.count(' ') == 2:
-                    space_2_count += 1
-                elif indent.count(' ') == 4:
-                    space_4_count += 1
+                else:
+                    width = len(indent)
+                    if width % 2 == 0 and width % 4 != 0:
+                        space_2_count += 1
+                    elif width % 4 == 0:
+                        space_4_count += 1
         if tab_count > space_2_count and tab_count > space_4_count:
             return "Tabs"
         elif space_2_count > space_4_count:
@@ -216,68 +220,155 @@ Guidelines:
             return "4 Spaces"
         return "Undetermined"
 
+    @staticmethod
+    def _generate_tree_text(files: List[Dict[str, Any]], max_entries: int = 80) -> str:
+        sorted_paths = sorted(f["path"] for f in files)
+        truncated = len(sorted_paths) > max_entries
+        if truncated:
+            sorted_paths = sorted_paths[:max_entries]
+
+        tree: Dict[str, Any] = {}
+        for path in sorted_paths:
+            parts = path.split('/')
+            node = tree
+            for part in parts:
+                if part not in node:
+                    node[part] = {}
+                node = node[part]
+
+        def render(node: Dict[str, Any], prefix: str = "") -> List[str]:
+            lines = []
+            items = sorted(node.items(), key=lambda x: (not bool(x[1]), x[0]))
+            for name, children in items:
+                if children:
+                    lines.append(f"{prefix}{name}/")
+                    lines.extend(render(children, prefix + "  "))
+                else:
+                    lines.append(f"{prefix}{name}")
+            return lines
+
+        result = "\n".join(render(tree))
+        if truncated:
+            result += f"\n... ({len(files) - max_entries} more files)"
+        return result
+
+    @staticmethod
+    def _get_file_type_breakdown(files: Dict[str, Any]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for path in files:
+            _, ext = os.path.splitext(path.lower())
+            ext = ext or "(no extension)"
+            counts[ext] = counts.get(ext, 0) + 1
+        return dict(sorted(counts.items(), key=lambda x: -x[1]))
+
+    @staticmethod
+    def _detect_entry_points(files: Dict[str, Any]) -> List[str]:
+        entry_patterns = [
+            r'(^|/)main\.(py|go|ts|js|tsx|jsx|rs)$',
+            r'(^|/)app\.(py|ts|js|tsx|jsx)$',
+            r'(^|/)index\.(ts|js|tsx|jsx)$',
+            r'(^|/)server\.(py|ts|js)$',
+            r'(^|/)manage\.py$',
+            r'(^|/)wsgi\.py$',
+            r'(^|/)asgi\.py$',
+            r'(^|/)urls\.py$',
+            r'(^|/)routes\.(py|ts|js)$',
+            r'(^|/)router\.(py|ts|js)$',
+            r'(^|/)cmd/.*\.go$',
+        ]
+        matches = []
+        for path in files:
+            for pattern in entry_patterns:
+                if re.search(pattern, path, re.IGNORECASE):
+                    matches.append(path)
+                    break
+        return sorted(matches)
+
     async def compare_repositories(self, repo_a_files: List[Dict[str, Any]], repo_b_files: List[Dict[str, Any]], 
                                   repo_a_name: str, repo_b_name: str,
                                   config_files_a: Optional[List[Dict[str, str]]] = None,
                                   config_files_b: Optional[List[Dict[str, str]]] = None,
-                                  modified_files_content: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-        """Perform a whole-project infrastructure audit and compare layouts of two projects using pure Python."""
+                                  modified_files_content: Optional[List[Dict[str, Any]]] = None,
+                                  entry_point_files_a: Optional[List[Dict[str, str]]] = None,
+                                  entry_point_files_b: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
         files_a = {f["path"]: f for f in repo_a_files}
         files_b = {f["path"]: f for f in repo_b_files}
         
         shared_paths = set(files_a.keys()) & set(files_b.keys())
         only_a = set(files_a.keys()) - set(files_b.keys())
         only_b = set(files_b.keys()) - set(files_a.keys())
-        
-        # Generate pure Python architectural comparison report in Markdown
+
+        tree_text_a = self._generate_tree_text(repo_a_files)
+        tree_text_b = self._generate_tree_text(repo_b_files)
+
+        ext_breakdown_a = self._get_file_type_breakdown(files_a)
+        ext_breakdown_b = self._get_file_type_breakdown(files_b)
+
+        entry_points_a = self._detect_entry_points(files_a)
+        entry_points_b = self._detect_entry_points(files_b)
+
+        def _detect_tech(files: Dict[str, Any]) -> List[str]:
+            tech = set()
+            for path in files:
+                if "package.json" in path: tech.add("Node.js")
+                if "requirements.txt" in path or "pyproject.toml" in path: tech.add("Python")
+                if "go.mod" in path: tech.add("Go")
+                if "pom.xml" in path or "build.gradle" in path: tech.add("Java")
+                if "Dockerfile" in path: tech.add("Docker")
+                if "tsconfig.json" in path: tech.add("TypeScript")
+                if "composer.json" in path: tech.add("PHP")
+                if "cargo.toml" in path or "Cargo.toml" in path: tech.add("Rust")
+                if ".csproj" in path or ".sln" in path: tech.add("C#/.NET")
+            return sorted(tech)
+
+        tech_a = _detect_tech(files_a)
+        tech_b = _detect_tech(files_b)
+        tech_a_str = ", ".join(tech_a) or "Generic/Other"
+        tech_b_str = ", ".join(tech_b) or "Generic/Other"
+
         md = []
-        md.append(f"# 🛠️ Repository Architectural Comparison: {repo_a_name} vs {repo_b_name}")
+        md.append(f"# Repository Architectural Comparison: {repo_a_name} vs {repo_b_name}")
         md.append("")
         
-        # 1. Directory Structure & Layout
-        md.append("## 📁 1. Directory Structure & Layout Alignment")
+        md.append("## 1. Directory Structure & Layout")
         md.append(f"- **Shared Files**: {len(shared_paths)} file(s)")
         md.append(f"- **Only in {repo_a_name}**: {len(only_a)} file(s)")
         md.append(f"- **Only in {repo_b_name}**: {len(only_b)} file(s)")
         md.append("")
-        
-        tech_a = []
-        tech_b = []
-        for path in files_a:
-            if "package.json" in path: tech_a.append("Node.js")
-            if "requirements.txt" in path or "pyproject.toml" in path: tech_a.append("Python")
-            if "go.mod" in path: tech_a.append("Go")
-            if "pom.xml" in path or "build.gradle" in path: tech_a.append("Java")
-            if "Dockerfile" in path: tech_a.append("Docker")
-            if "tsconfig.json" in path: tech_a.append("TypeScript")
-            
-        for path in files_b:
-            if "package.json" in path: tech_b.append("Node.js")
-            if "requirements.txt" in path or "pyproject.toml" in path: tech_b.append("Python")
-            if "go.mod" in path: tech_b.append("Go")
-            if "pom.xml" in path or "build.gradle" in path: tech_b.append("Java")
-            if "Dockerfile" in path: tech_b.append("Docker")
-            if "tsconfig.json" in path: tech_b.append("TypeScript")
-            
-        tech_a_str = ", ".join(sorted(list(set(tech_a)))) or "Generic/Other"
-        tech_b_str = ", ".join(sorted(list(set(tech_b)))) or "Generic/Other"
-        
+
+        md.append(f"### Folder Tree: {repo_a_name}")
+        md.append("```")
+        md.append(tree_text_a)
+        md.append("```")
+        md.append("")
+        md.append(f"### Folder Tree: {repo_b_name}")
+        md.append("```")
+        md.append(tree_text_b)
+        md.append("```")
+        md.append("")
+
         md.append(f"| Metric | {repo_a_name} | {repo_b_name} |")
         md.append("| :--- | :--- | :--- |")
-        md.append(f"| **Tech Stack / Core Tech** | {tech_a_str} | {tech_b_str} |")
+        md.append(f"| **Tech Stack** | {tech_a_str} | {tech_b_str} |")
         md.append(f"| **Total Files** | {len(files_a)} | {len(files_b)} |")
-        md.append(f"| **Docker Present** | {'Yes' if 'Docker' in tech_a else 'No'} | {'Yes' if 'Docker' in tech_b else 'No'} |")
-        md.append(f"| **CI/CD Configuration** | {'Yes' if any('.github/workflows' in p for p in files_a) else 'No'} | {'Yes' if any('.github/workflows' in p for p in files_b) else 'No'} |")
+        md.append(f"| **Docker** | {'Yes' if 'Docker' in tech_a else 'No'} | {'Yes' if 'Docker' in tech_b else 'No'} |")
+        md.append(f"| **CI/CD** | {'Yes' if any('.github/workflows' in p for p in files_a) else 'No'} | {'Yes' if any('.github/workflows' in p for p in files_b) else 'No'} |")
+        md.append(f"| **Entry Points** | {', '.join(f'`{e}`' for e in entry_points_a) or 'None detected'} | {', '.join(f'`{e}`' for e in entry_points_b) or 'None detected'} |")
+        md.append("")
+
+        md.append("## 2. File Type Breakdown")
+        all_exts = sorted(set(list(ext_breakdown_a.keys()) + list(ext_breakdown_b.keys())))
+        md.append(f"| Extension | {repo_a_name} | {repo_b_name} |")
+        md.append("| :--- | :--- | :--- |")
+        for ext in all_exts:
+            md.append(f"| `{ext}` | {ext_breakdown_a.get(ext, 0)} | {ext_breakdown_b.get(ext, 0)} |")
         md.append("")
         
-        # 2. File Naming Conventions
-        md.append("## 🏷️ 2. File Naming Conventions")
+        md.append("## 3. File Naming Conventions")
         style_a = self._analyze_naming_style(list(files_a.keys()))
         style_b = self._analyze_naming_style(list(files_b.keys()))
         
-        md.append("The styling conventions detected for file names are summarized below:")
-        md.append("")
-        md.append(f"| Convention Style | {repo_a_name} | {repo_b_name} |")
+        md.append(f"| Convention | {repo_a_name} | {repo_b_name} |")
         md.append("| :--- | :--- | :--- |")
         for style in ["snake_case", "camelCase", "PascalCase", "kebab-case", "lowercase", "other"]:
             cnt_a = style_a["stats"].get(style, 0)
@@ -287,19 +378,12 @@ Guidelines:
             md.append(f"| **{style}** | {cnt_a} ({pct_a}) | {cnt_b} ({pct_b}) |")
             
         md.append("")
-        md.append(f"- **Dominant Style in {repo_a_name}**: `{style_a['dominant']}`")
-        md.append(f"- **Dominant Style in {repo_b_name}**: `{style_b['dominant']}`")
-        md.append("")
-        if style_a['dominant'] != style_b['dominant'] and style_a['dominant'] != "mixed / other" and style_b['dominant'] != "mixed / other":
-            md.append(f"> [!WARNING]\n> **Inconsistent Naming Convention**: Repo A dominantly uses `{style_a['dominant']}` while Repo B uses `{style_b['dominant']}`. Ensure code style standardization across teams.")
-        else:
-            md.append(f"> [!NOTE]\n> **Consistent Naming**: Both repositories follow a similar naming philosophy.")
+        md.append(f"- **Dominant in {repo_a_name}**: `{style_a['dominant']}`")
+        md.append(f"- **Dominant in {repo_b_name}**: `{style_b['dominant']}`")
         md.append("")
         
-        # 3. Code Style & Package Dependencies Comparison
-        md.append("## 📦 3. Coding Style & Package Dependencies Gap")
+        md.append("## 4. Coding Style & Dependencies")
         
-        # Check indentation styles
         indents_a = {}
         if config_files_a:
             for f in config_files_a:
@@ -310,8 +394,8 @@ Guidelines:
                 indents_b[f["path"]] = self._check_indentation(f["content"])
                 
         if indents_a or indents_b:
-            md.append("### Indentation Checks in Config Files")
-            md.append(f"| Config File | Indentation Style ({repo_a_name}) | Indentation Style ({repo_b_name}) |")
+            md.append("### Indentation")
+            md.append(f"| Config File | {repo_a_name} | {repo_b_name} |")
             md.append("| :--- | :--- | :--- |")
             all_configs = set(indents_a.keys()) | set(indents_b.keys())
             for cfg in sorted(list(all_configs)):
@@ -320,17 +404,15 @@ Guidelines:
                 md.append(f"| `{cfg}` | {val_a} | {val_b} |")
             md.append("")
             
-        # Parse package.json
         pkg_json_a = next((f["content"] for f in (config_files_a or []) if f["path"].endswith("package.json")), None)
         pkg_json_b = next((f["content"] for f in (config_files_b or []) if f["path"].endswith("package.json")), None)
         
         if pkg_json_a or pkg_json_b:
-            md.append("### JavaScript / Node.js Dependency Gap")
+            md.append("### Node.js Dependencies")
             deps_a = self._parse_pkg_dependencies(pkg_json_a) if pkg_json_a else {}
             deps_b = self._parse_pkg_dependencies(pkg_json_b) if pkg_json_b else {}
             
             all_deps = set(deps_a.keys()) | set(deps_b.keys())
-            
             mismatches = []
             only_in_deps_a = []
             only_in_deps_b = []
@@ -338,7 +420,7 @@ Guidelines:
             for dep in sorted(list(all_deps)):
                 if dep in deps_a and dep in deps_b:
                     if deps_a[dep] != deps_b[dep]:
-                        mismatches.append(f"- `{dep}`: `{deps_a[dep]}` in Repo A vs `{deps_b[dep]}` in Repo B")
+                        mismatches.append(f"- `{dep}`: `{deps_a[dep]}` vs `{deps_b[dep]}`")
                 elif dep in deps_a:
                     only_in_deps_a.append(f"- `{dep}` (`{deps_a[dep]}`)")
                 elif dep in deps_b:
@@ -346,35 +428,29 @@ Guidelines:
                     
             if mismatches:
                 md.append("#### Version Mismatches")
-                for m in mismatches:
-                    md.append(m)
+                md.extend(mismatches)
                 md.append("")
             if only_in_deps_a:
-                md.append(f"#### Dependencies only in {repo_a_name}")
-                for o in only_in_deps_a:
-                    md.append(o)
+                md.append(f"#### Only in {repo_a_name}")
+                md.extend(only_in_deps_a)
                 md.append("")
             if only_in_deps_b:
-                md.append(f"#### Dependencies only in {repo_b_name}")
-                for o in only_in_deps_b:
-                    md.append(o)
+                md.append(f"#### Only in {repo_b_name}")
+                md.extend(only_in_deps_b)
                 md.append("")
-                
             if not mismatches and not only_in_deps_a and not only_in_deps_b:
-                md.append("✅ Node.js dependencies are fully in sync!")
+                md.append("Node.js dependencies are fully in sync.")
                 md.append("")
                 
-        # Parse requirements.txt
         req_a = next((f["content"] for f in (config_files_a or []) if f["path"].endswith("requirements.txt")), None)
         req_b = next((f["content"] for f in (config_files_b or []) if f["path"].endswith("requirements.txt")), None)
         
         if req_a or req_b:
-            md.append("### Python Dependency Gap")
+            md.append("### Python Dependencies")
             deps_a = self._parse_req_dependencies(req_a) if req_a else {}
             deps_b = self._parse_req_dependencies(req_b) if req_b else {}
             
             all_deps = set(deps_a.keys()) | set(deps_b.keys())
-            
             mismatches = []
             only_in_deps_a = []
             only_in_deps_b = []
@@ -382,7 +458,7 @@ Guidelines:
             for dep in sorted(list(all_deps)):
                 if dep in deps_a and dep in deps_b:
                     if deps_a[dep] != deps_b[dep]:
-                        mismatches.append(f"- `{dep}`: `{deps_a[dep]}` in Repo A vs `{deps_b[dep]}` in Repo B")
+                        mismatches.append(f"- `{dep}`: `{deps_a[dep]}` vs `{deps_b[dep]}`")
                 elif dep in deps_a:
                     only_in_deps_a.append(f"- `{dep}` (`{deps_a[dep]}`)")
                 elif dep in deps_b:
@@ -390,96 +466,124 @@ Guidelines:
                     
             if mismatches:
                 md.append("#### Version Mismatches")
-                for m in mismatches:
-                    md.append(m)
+                md.extend(mismatches)
                 md.append("")
             if only_in_deps_a:
-                md.append(f"#### Packages only in {repo_a_name}")
-                for o in only_in_deps_a:
-                    md.append(o)
+                md.append(f"#### Only in {repo_a_name}")
+                md.extend(only_in_deps_a)
                 md.append("")
             if only_in_deps_b:
-                md.append(f"#### Packages only in {repo_b_name}")
-                for o in only_in_deps_b:
-                    md.append(o)
+                md.append(f"#### Only in {repo_b_name}")
+                md.extend(only_in_deps_b)
                 md.append("")
-                
             if not mismatches and not only_in_deps_a and not only_in_deps_b:
-                md.append("✅ Python packages are fully in sync!")
+                md.append("Python packages are fully in sync.")
                 md.append("")
-                
-        if not (indents_a or indents_b) and not (pkg_json_a or pkg_json_b) and not (req_a or req_b):
-            md.append("No configuration or dependency files (such as `package.json` or `requirements.txt`) were detected in either repository.")
-            md.append("")
-        
-        # Call the AI Gateway to generate a comprehensive comparison report if API key is present
+
         if self.api_key and self.api_key.lower() not in ("null", "undefined", ""):
             try:
                 system_prompt = (
-                    "You are an expert software architect and code reviewer.\n"
-                    "Your task is to analyze the structural, layout, dependency, and configuration differences between two repositories and provide a comprehensive, highly detailed comparison report in Markdown.\n"
-                    "Highlight key differences, technology stack alignments, dependency mismatches, and potential integration issues.\n"
-                    "Write the report in a professional, clear tone. Avoid placeholders. Use markdown formatting like lists, code blocks, and alerts where appropriate."
+                    "You are an expert software architect performing a deep behavioral and structural comparison of two codebases.\n"
+                    "You will receive:\n"
+                    "1. Full directory tree listings for both repositories\n"
+                    "2. Entry point file contents (main files, app files, routers, etc.)\n"
+                    "3. Modified files showing how the same file differs between repos\n"
+                    "4. Dependency and configuration metadata\n\n"
+                    "Your analysis MUST cover:\n"
+                    "- **Folder Architecture**: Map each repo's folder structure, explain what each top-level directory does, and compare the organizational patterns (monorepo vs multi-folder, feature-based vs layer-based, etc.)\n"
+                    "- **Entry Points & Application Flow**: Trace how each application boots up, what the main entry point does, how routing/request handling is wired, and how data flows through the system\n"
+                    "- **Behavioral Differences**: For each modified file, explain WHAT the code does (its purpose/behavior), not just syntactic differences. Compare the business logic, algorithms, error handling strategies, and API contracts\n"
+                    "- **Component Mapping**: Create a mapping table showing which component/module in Repo A corresponds to which in Repo B (or is missing)\n"
+                    "- **Technology & Pattern Differences**: Compare frameworks, design patterns (MVC, service layer, etc.), state management, data access patterns\n"
+                    "- **Risk Assessment**: What could break during migration? What behavioral differences could cause bugs?\n\n"
+                    "Write in Markdown. Be specific with file paths and code references. No placeholders or generic statements."
                 )
                 
-                # Format code content differences if we have modified files
+                entry_points_text = ""
+                if entry_point_files_a:
+                    entry_points_text += f"\n### Entry Point Files in {repo_a_name}:\n"
+                    for f in entry_point_files_a:
+                        lines = f["content"].splitlines()[:150]
+                        content = "\n".join(lines)
+                        if len(f["content"].splitlines()) > 150:
+                            content += "\n... [truncated]"
+                        entry_points_text += f"\n`{f['path']}`:\n```\n{content}\n```\n"
+
+                if entry_point_files_b:
+                    entry_points_text += f"\n### Entry Point Files in {repo_b_name}:\n"
+                    for f in entry_point_files_b:
+                        lines = f["content"].splitlines()[:150]
+                        content = "\n".join(lines)
+                        if len(f["content"].splitlines()) > 150:
+                            content += "\n... [truncated]"
+                        entry_points_text += f"\n`{f['path']}`:\n```\n{content}\n```\n"
+
                 modified_files_text = ""
                 if modified_files_content:
-                    modified_files_text = "\n### Modified Files Code Differences:\n"
+                    modified_files_text = "\n### Modified Files (same path, different content):\n"
                     for item in modified_files_content:
                         path = item["path"]
-                        content_a = item["content_a"]
-                        content_b = item["content_b"]
-                        # Read first 200 lines to keep prompt clean
-                        lines_a = content_a.splitlines()[:200]
-                        lines_b = content_b.splitlines()[:200]
-                        truncated_a = "\n".join(lines_a) + ("\n... [truncated]" if len(content_a.splitlines()) > 200 else "")
-                        truncated_b = "\n".join(lines_b) + ("\n... [truncated]" if len(content_b.splitlines()) > 200 else "")
-                        
+                        lines_a = item["content_a"].splitlines()[:300]
+                        lines_b = item["content_b"].splitlines()[:300]
+                        truncated_a = "\n".join(lines_a) + ("\n... [truncated]" if len(item["content_a"].splitlines()) > 300 else "")
+                        truncated_b = "\n".join(lines_b) + ("\n... [truncated]" if len(item["content_b"].splitlines()) > 300 else "")
                         modified_files_text += f"""
-File Path: `{path}`
----- CODE IN REPO A ----
+File: `{path}`
+---- {repo_a_name} ----
 ```
 {truncated_a}
 ```
----- CODE IN REPO B ----
+---- {repo_b_name} ----
 ```
 {truncated_b}
 ```
 """
-                
-                # Format a summary of the differences to send to the LLM
-                user_prompt = f"""Compare these two repositories:
-Base Repository (Repo A): {repo_a_name}
-Target Repository (Repo B): {repo_b_name}
 
-Summary Statistics:
-- Total files in Repo A: {len(files_a)}
-- Total files in Repo B: {len(files_b)}
+                ext_text_a = ", ".join(f"{ext}: {cnt}" for ext, cnt in list(ext_breakdown_a.items())[:15])
+                ext_text_b = ", ".join(f"{ext}: {cnt}" for ext, cnt in list(ext_breakdown_b.items())[:15])
+
+                user_prompt = f"""Compare these two repositories in depth:
+
+## Repo A: {repo_a_name}
+### Directory Tree:
+```
+{tree_text_a}
+```
+- Tech Stack: {tech_a_str}
+- Total Files: {len(files_a)}
+- File Types: {ext_text_a}
+- Entry Points: {', '.join(entry_points_a) or 'None detected'}
+
+## Repo B: {repo_b_name}
+### Directory Tree:
+```
+{tree_text_b}
+```
+- Tech Stack: {tech_b_str}
+- Total Files: {len(files_b)}
+- File Types: {ext_text_b}
+- Entry Points: {', '.join(entry_points_b) or 'None detected'}
+
+## Overlap Statistics:
 - Shared files: {len(shared_paths)}
-- Files unique to Repo A: {len(only_a)} (showing first 20: {sorted(list(only_a))[:20]})
-- Files unique to Repo B: {len(only_b)} (showing first 20: {sorted(list(only_b))[:20]})
+- Only in Repo A: {len(only_a)} ({sorted(list(only_a))[:30]})
+- Only in Repo B: {len(only_b)} ({sorted(list(only_b))[:30]})
 
-Detected Tech Stacks:
-- Repo A: {tech_a_str}
-- Repo B: {tech_b_str}
+## Naming Conventions:
+- Repo A dominant: {style_a['dominant']}
+- Repo B dominant: {style_b['dominant']}
 
-Naming Conventions:
-- Repo A: {style_a['dominant']} (stats: {style_a['percentages']})
-- Repo B: {style_b['dominant']} (stats: {style_b['percentages']})
-
-Configuration & Dependency Files:
-- Repo A configurations: {list(indents_a.keys())}
-- Repo B configurations: {list(indents_b.keys())}
+{entry_points_text}
 
 {modified_files_text}
 
-Please write a comprehensive and detailed architectural comparison report in Markdown, including:
-1. Detailed directory structure and layout alignment analysis.
-2. Code-level syntax, structure, and implementation logic differences (comparing the code contents of modified files provided above).
-3. Code styling, indentation, and naming convention analysis.
-4. Complete dependency and packages gap review.
-5. Actionable recommendations and migration plan.
+Provide a comprehensive deep-dive comparison covering:
+1. **Folder Architecture Analysis**: What does each directory do? How are the repos organized differently?
+2. **Application Behavior & Flow**: Trace each app's startup, request handling, and data flow based on the entry points and code provided
+3. **Component-by-Component Mapping**: Which modules in Repo A map to which in Repo B? What's missing or added?
+4. **Code Behavior Differences**: For each modified file, explain the functional/behavioral differences (not just syntax)
+5. **Dependency & Infrastructure Gap**: What libraries, tools, or configs differ and what's the impact?
+6. **Migration Risk Assessment**: What would break if migrating from A to B or vice versa?
 """
                 
                 payload = {
@@ -496,29 +600,26 @@ Please write a comprehensive and detailed architectural comparison report in Mar
                         f"{self.gateway_url}/chat/completions",
                         headers=self._get_headers(),
                         json=payload,
-                        timeout=60.0
+                        timeout=120.0
                     )
                     
                     if response.status_code == 200:
                         resp_json = response.json()
-                        ai_text = resp_json["choices"][0]["message"]["content"]
-                        # Prepend the generated report to the local python markdown report
-                        ai_report = [
-                            f"# 🛠️ Repository Architectural Comparison: {repo_a_name} vs {repo_b_name}",
-                            "",
-                            ai_text,
-                            "",
-                            "---",
-                            "## 📊 Summary Metrics (Locally Verified)",
-                            ""
-                        ]
-                        # Append the local python generated tables/details for backup
-                        ai_report.extend(md[1:])
-                        md = ai_report
-                    else:
-                        print(f"AI Gateway returned status {response.status_code}: {response.text}")
+                        ai_text = resp_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        if ai_text:
+                            ai_report = [
+                                f"# Repository Comparison: {repo_a_name} vs {repo_b_name}",
+                                "",
+                                ai_text,
+                                "",
+                                "---",
+                                "## Locally Verified Metrics",
+                                ""
+                            ]
+                            ai_report.extend(md[1:])
+                            md = ai_report
             except Exception as e:
-                print(f"Failed to generate AI comparison report, using local report: {e}")
+                print(f"AI comparison failed, using local report: {e}")
                 
         return {
             "repo_a": repo_a_name,
@@ -632,82 +733,10 @@ Please write a comprehensive and detailed architectural comparison report in Mar
             "summary": summary
         }
 
-    def _get_mock_comparison(self, repo_a: str, repo_b: str, shared: List[str], only_a: List[str], only_b: List[str]) -> str:
-        """Create mock markdown comparison text."""
-        return f"""### MOCK Architectural Comparison: {repo_a} vs {repo_b}
-*Note: This is simulated comparison analysis (Custom AI Gateway API Key is not set or failed).*
-
-#### 1. Directory & File Overlap
-- **Shared Files**: {len(shared)} file(s) matched between both repos.
-- **Unique to {repo_a}**: {len(only_a)} file(s).
-- **Unique to {repo_b}**: {len(only_b)} file(s).
-
-#### 2. Structural Observations
-- **Repository A ({repo_a})** appears to follow a standard project layout. Unique files suggest custom client configuration or documentation.
-- **Repository B ({repo_b})** includes files that might represent a refactored structure, localized testing setup, or different deployment scripts.
-
-#### 3. Technology Stack Comparison
-- Common extensions detected: `.py`, `.js`, `.json`, `.md`.
-- Both repositories share core structural layers. If migrating from Repo A to Repo B, ensure environment variables and config files are synchronized.
-"""
 
 def get_sqlite_schema(db_path: str) -> Dict[str, Any]:
     import sqlite3
     db_path = db_path.strip()
-    if (db_path == "dev.sqlite" or db_path == "prod.sqlite") and not os.path.exists(db_path):
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        if db_path == "dev.sqlite":
-            cursor.execute("""
-                CREATE TABLE users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT NOT NULL UNIQUE,
-                    email TEXT NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            cursor.execute("""
-                CREATE TABLE products (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    description TEXT,
-                    price DECIMAL(10, 2) NOT NULL,
-                    stock INTEGER DEFAULT 0,
-                    category_id INTEGER,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            """)
-            cursor.execute("""
-                CREATE TABLE orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    total_amount DECIMAL(10, 2) NOT NULL,
-                    status TEXT DEFAULT 'pending'
-                );
-            """)
-        else:
-            cursor.execute("""
-                CREATE TABLE users (
-                    id INTEGER PRIMARY KEY,
-                    username TEXT NOT NULL,
-                    email TEXT,
-                    password_hash TEXT NOT NULL,
-                    created_at TIMESTAMP
-                );
-            """)
-            cursor.execute("""
-                CREATE TABLE orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    order_date TIMESTAMP,
-                    total_amount DECIMAL(12, 2) NOT NULL
-                );
-            """)
-        conn.commit()
-        conn.close()
 
     if not os.path.exists(db_path) and db_path != ":memory:":
         raise Exception(f"SQLite database file not found at path: {db_path}")
@@ -720,7 +749,7 @@ def get_sqlite_schema(db_path: str) -> Dict[str, Any]:
         
         schema = {}
         for table in tables:
-            cursor.execute(f"PRAGMA table_info(`{table}`);")
+            cursor.execute(f'PRAGMA table_info("{table}");')
             columns_info = cursor.fetchall()
             
             columns = {}
@@ -964,15 +993,14 @@ def fetch_schema_from_connection(conn_str: str) -> Dict[str, Any]:
         return get_mysql_schema(conn_str)
     elif conn_str_lower.startswith("mssql://") or conn_str_lower.startswith("sqlserver://"):
         return get_mssql_schema(conn_str)
-    elif conn_str_lower.startswith("sqlite://") or conn_str_lower.endswith(".db") or conn_str_lower.endswith(".sqlite") or ("/" not in conn_str and "\\" not in conn_str):
-        path = conn_str
-        if conn_str_lower.startswith("sqlite:///"):
-            path = conn_str[10:]
-        elif conn_str_lower.startswith("sqlite://"):
-            path = conn_str[9:]
-        return get_sqlite_schema(path)
-    else:
+    elif conn_str_lower.startswith("sqlite:///"):
+        return get_sqlite_schema(conn_str[10:])
+    elif conn_str_lower.startswith("sqlite://"):
+        return get_sqlite_schema(conn_str[9:])
+    elif conn_str_lower.endswith(".db") or conn_str_lower.endswith(".sqlite"):
         return get_sqlite_schema(conn_str)
+    else:
+        raise Exception(f"Unsupported connection string format. Use postgresql://, mysql://, mssql://, or sqlite:/// prefix.")
 
 def compare_database_schemas(schema_a: str, schema_b: str, name_a: str = "Database A", name_b: str = "Database B") -> Dict[str, Any]:
     try:
