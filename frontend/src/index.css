@@ -4,34 +4,34 @@
   --font-sans: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --font-mono: 'Fira Code', source-code-pro, Menlo, Monaco, Consolas, monospace;
   
-  /* Cyberpunk / Dark Mode Palette */
-  --bg-app: #080b11;
-  --bg-sidebar: #0c101a;
-  --bg-card: rgba(18, 25, 41, 0.7);
-  --bg-card-hover: rgba(26, 36, 58, 0.85);
-  --bg-input: #0f1524;
-  --bg-code: #0b0f19;
+  /* Hacker Theme (Black & Green) Palette */
+  --bg-app: #020402;
+  --bg-sidebar: #050805;
+  --bg-card: rgba(8, 12, 8, 0.8);
+  --bg-card-hover: rgba(12, 20, 12, 0.9);
+  --bg-input: #060a06;
+  --bg-code: #040604;
   
-  --border-glow: rgba(6, 182, 212, 0.15);
-  --border-light: rgba(255, 255, 255, 0.08);
-  --border-active: rgba(6, 182, 212, 0.5);
+  --border-glow: rgba(21, 128, 61, 0.2);
+  --border-light: rgba(21, 128, 61, 0.1);
+  --border-active: rgba(21, 128, 61, 0.6);
   
-  --accent-cyan: #06b6d4;
-  --accent-cyan-rgb: 6, 182, 212;
-  --accent-purple: #a855f7;
-  --accent-purple-rgb: 168, 85, 247;
+  --accent-cyan: #15803d;
+  --accent-cyan-rgb: 21, 128, 61;
+  --accent-purple: #166534;
+  --accent-purple-rgb: 22, 101, 52;
   
-  --text-primary: #f8fafc;
-  --text-secondary: #94a3b8;
-  --text-muted: #475569;
+  --text-primary: #ecfdf5;
+  --text-secondary: #86efac;
+  --text-muted: #15803d;
   
   --severity-info: #38bdf8;
   --severity-warning: #fbbf24;
   --severity-error: #f87171;
   --severity-success: #34d399;
   
-  --shadow-glow-cyan: 0 0 15px rgba(6, 182, 212, 0.25);
-  --shadow-glow-purple: 0 0 15px rgba(168, 85, 247, 0.25);
+  --shadow-glow-cyan: 0 0 15px rgba(21, 128, 61, 0.35);
+  --shadow-glow-purple: 0 0 15px rgba(22, 101, 52, 0.35);
 }
 
 * {
@@ -48,9 +48,6 @@ body {
   height: 100vh;
   width: 100vw;
   -webkit-font-smoothing: antialiased;
-  background-image: 
-    radial-gradient(at 0% 0%, rgba(6, 182, 212, 0.05) 0px, transparent 50%),
-    radial-gradient(at 100% 100%, rgba(168, 85, 247, 0.05) 0px, transparent 50%);
 }
 
 #root {
@@ -95,9 +92,7 @@ body {
   font-size: 1.25rem;
   font-weight: 700;
   letter-spacing: 0.5px;
-  background: linear-gradient(135deg, var(--accent-cyan), var(--accent-purple));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
+  color: var(--accent-cyan);
 }
 
 .sidebar-section {
@@ -148,7 +143,7 @@ body {
 .btn-primary {
   width: 100%;
   padding: 10px 16px;
-  background: linear-gradient(135deg, var(--accent-cyan), #0891b2);
+  background-color: var(--accent-cyan);
   border: none;
   border-radius: 8px;
   color: #04060a;
@@ -772,4 +767,38 @@ body {
 @keyframes slide-down {
   0% { transform: translateY(-4px); opacity: 0; }
   100% { transform: translateY(0); opacity: 1; }
+}
+
+.hacker-scanline-1 {
+  position: fixed;
+  left: 0;
+  width: 100%;
+  height: 2px;
+  background-color: var(--accent-cyan);
+  pointer-events: none;
+  z-index: 9999;
+  animation: scanline-1 4s linear infinite;
+  opacity: 0.25;
+}
+
+.hacker-scanline-2 {
+  position: fixed;
+  left: 0;
+  width: 100%;
+  height: 2px;
+  background-color: var(--accent-cyan);
+  pointer-events: none;
+  z-index: 9999;
+  animation: scanline-2 4s linear infinite;
+  opacity: 0.25;
+}
+
+@keyframes scanline-1 {
+  0% { transform: translateY(-100px); }
+  100% { transform: translateY(100vh); }
+}
+
+@keyframes scanline-2 {
+  0% { transform: translateY(-300px); }
+  100% { transform: translateY(100vh); }
 }

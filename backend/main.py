@@ -324,6 +324,32 @@ async def compare_db_schemas(request: DbCompareRequest):
     except Exception:
         raise HTTPException(status_code=500, detail="Failed to compare database schemas.")
 
+class ListDbsRequest(BaseModel):
+    db_type: str
+    host: str
+    port: Optional[int] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+
+@app.post("/api/list-databases")
+async def list_databases_endpoint(request: ListDbsRequest):
+    try:
+        from reviewer import list_databases
+        dbs = list_databases(
+            db_type=request.db_type,
+            host=request.host,
+            port=request.port,
+            username=request.username,
+            password=request.password
+        )
+        return {"databases": dbs}
+    except Exception as e:
+        print(f"DB List Error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to retrieve database list. Please check connection settings and credentials."
+        )
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

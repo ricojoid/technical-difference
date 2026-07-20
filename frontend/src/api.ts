@@ -53,6 +53,8 @@ export interface CompareResponse {
   only_in_b_count: number;
   only_in_a: string[];
   only_in_b: string[];
+  modified_files?: string[];
+  modified_files_count?: number;
   ai_comparison: string;
 }
 
@@ -68,6 +70,12 @@ export interface DbCompareResponse {
     column_default_diffs: Array<{ column: string; a: string; b: string }>;
     pk_diff?: { a: string[]; b: string[] };
   }>;
+  procedures_only_in_a?: string[];
+  procedures_only_in_b?: string[];
+  procedures_in_both?: string[];
+  procedure_diffs?: Record<string, { a: string; b: string }>;
+  sync_script?: string;
+  db_type?: string;
   markdown_report: string;
 }
 
@@ -201,3 +209,34 @@ export async function compareDatabases(
   }
   return response.json();
 }
+
+export interface ListDbsResponse {
+  databases: string[];
+}
+
+export async function listDatabases(
+  dbType: string,
+  host: string,
+  port?: number,
+  username?: string,
+  password?: string
+): Promise<ListDbsResponse> {
+  const headers = getHeaders();
+  const response = await fetch(`${BASE_URL}/api/list-databases`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      db_type: dbType,
+      host,
+      port,
+      username,
+      password,
+    }),
+  });
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({ detail: 'Failed to retrieve database list.' }));
+    throw new Error(errorData.detail || `HTTP error ${response.status}`);
+  }
+  return response.json();
+}
+

@@ -297,6 +297,14 @@ Guidelines:
         shared_paths = set(files_a.keys()) & set(files_b.keys())
         only_a = set(files_a.keys()) - set(files_b.keys())
         only_b = set(files_b.keys()) - set(files_a.keys())
+        
+        modified_files = []
+        for path in shared_paths:
+            f_a = files_a[path]
+            f_b = files_b[path]
+            if f_a.get("type") == "file" and f_b.get("type") == "file":
+                if f_a.get("sha") != f_b.get("sha"):
+                    modified_files.append(path)
 
         tree_text_a = self._generate_tree_text(repo_a_files)
         tree_text_b = self._generate_tree_text(repo_b_files)
@@ -631,6 +639,8 @@ Provide a comprehensive deep-dive comparison covering:
             "only_in_b_count": len(only_b),
             "only_in_a": sorted(list(only_a)),
             "only_in_b": sorted(list(only_b)),
+            "modified_files": sorted(list(modified_files)),
+            "modified_files_count": len(modified_files),
             "ai_comparison": "\n".join(md)
         }
 
@@ -778,7 +788,10 @@ def get_sqlite_schema(db_path: str) -> Dict[str, Any]:
                 "indexes": [],
                 "foreign_keys": []
             }
-        return schema
+        return {
+            "tables": schema,
+            "procedures": {}
+        }
     finally:
         conn.close()
 
@@ -846,7 +859,11 @@ def get_postgres_schema(conn_str: str) -> Dict[str, Any]:
                 "indexes": [],
                 "foreign_keys": []
             }
-        return schema
+        procs = get_postgres_procedures(cursor)
+        return {
+            "tables": schema,
+            "procedures": procs
+        }
     finally:
         conn.close()
 
@@ -902,7 +919,11 @@ def get_mysql_schema(conn_str: str) -> Dict[str, Any]:
                 "indexes": [],
                 "foreign_keys": []
             }
-        return schema
+        procs = get_mysql_procedures(cursor)
+        return {
+            "tables": schema,
+            "procedures": procs
+        }
     finally:
         conn.close()
 
@@ -981,7 +1002,11 @@ def get_mssql_schema(conn_str: str) -> Dict[str, Any]:
                 "indexes": [],
                 "foreign_keys": []
             }
-        return schema
+        procs = get_mssql_procedures(cursor)
+        return {
+            "tables": schema,
+            "procedures": procs
+        }
     finally:
         conn.close()
 
@@ -1002,16 +1027,236 @@ def fetch_schema_from_connection(conn_str: str) -> Dict[str, Any]:
     else:
         raise Exception(f"Unsupported connection string format. Use postgresql://, mysql://, mssql://, or sqlite:/// prefix.")
 
+def normalize_sql(sql: str) -> str:
+    if not sql:
+        return ""
+    return re.sub(r'\s+', ' ', sql.strip().upper())
+
+def get_mssql_procedures(cursor) -> Dict[str, str]:
+    try:
+        cursor.execute("""
+            SELECT 
+                o.name AS name,
+                m.definition AS definition
+            FROM 
+                sys.objects o
+            JOIN 
+                sys.sql_modules m ON o.object_id = m.object_id
+            WHERE 
+                o.type = 'P' AND o.is_ms_shipped = 0;
+        """)
+        return {row[0]: row[1] for row in cursor.fetchall() if row[0] is not None}
+    except Exception:
+        return {}
+
+def get_postgres_procedures(cursor) -> Dict[str, str]:
+    try:
+        cursor.execute("""
+            SELECT 
+                p.proname AS name,
+                pg_get_functiondef(p.oid) AS definition
+            FROM 
+                pg_proc p
+            JOIN 
+                pg_namespace n ON p.pronamespace = n.oid
+            WHERE 
+                n.nspname = 'public';
+        """)
+        return {row[0]: row[1] for row in cursor.fetchall() if row[0] is not None}
+    except Exception:
+        return {}
+
+def get_mysql_procedures(cursor) -> Dict[str, str]:
+    try:
+        cursor.execute("""
+            SELECT 
+                ROUTINE_NAME, 
+                ROUTINE_DEFINITION 
+            FROM 
+                INFORMATION_SCHEMA.ROUTINES 
+            WHERE 
+                ROUTINE_SCHEMA = DATABASE() AND ROUTINE_TYPE = 'PROCEDURE';
+        """)
+        return {row[0]: row[1] for row in cursor.fetchall() if row[0] is not None}
+    except Exception:
+        return {}
+
+def generate_db_sync_script(
+    tables_a: Dict[str, Any],
+    tables_only_a: List[str],
+    diffs: Dict[str, Any],
+    procs_a: Dict[str, Any],
+    procs_only_a: List[str],
+    proc_diffs: Dict[str, Any],
+    db_type: str
+) -> str:
+    lines = []
+    lines.append(f"-- ===========================================================================")
+    lines.append(f"-- DATABASE MIGRATION & SYNCHRONIZATION SCRIPT")
+    lines.append(f"-- Generated dynamically to sync Target database ({db_type.upper()}) to match Source database")
+    lines.append(f"-- Generation Time: 2026-07-20 (Antigravity AI)")
+    lines.append(f"-- ===========================================================================")
+    lines.append("")
+    
+    def quote_ident(name):
+        if db_type == "mssql":
+            return f"[{name}]"
+        elif db_type == "mysql":
+            return f"`{name}`"
+        else:
+            return f'"{name}"'
+            
+    # 1. CREATE NEW TABLES
+    if tables_only_a:
+        lines.append("-- ---------------------------------------------------------------------------")
+        lines.append("-- 1. CREATE NEW TABLES")
+        lines.append("-- ---------------------------------------------------------------------------")
+        for table in tables_only_a:
+            t_data = tables_a[table]
+            col_defs = []
+            for col_name, col_data in t_data["columns"].items():
+                null_str = "NULL" if col_data["nullable"] else "NOT NULL"
+                def_str = f" DEFAULT {col_data['default']}" if col_data["default"] is not None else ""
+                col_defs.append(f"    {quote_ident(col_name)} {col_data['type']} {null_str}{def_str}")
+            
+            if t_data.get("primary_key"):
+                pk_cols = ", ".join(quote_ident(c) for c in t_data["primary_key"])
+                col_defs.append(f"    PRIMARY KEY ({pk_cols})")
+                
+            create_sql = f"CREATE TABLE {quote_ident(table)} (\n" + ",\n".join(col_defs) + "\n);"
+            lines.append(create_sql)
+            if db_type == "mssql":
+                lines.append("GO")
+            lines.append("")
+            
+    # 2. ALTER EXISTING TABLES
+    has_table_alters = False
+    for table, t_diff in diffs.items():
+        if t_diff.get("columns_only_in_a") or t_diff.get("column_type_diffs") or t_diff.get("column_nullability_diffs"):
+            has_table_alters = True
+            break
+            
+    if has_table_alters:
+        lines.append("-- ---------------------------------------------------------------------------")
+        lines.append("-- 2. ALTER EXISTING TABLES")
+        lines.append("-- ---------------------------------------------------------------------------")
+        for table, t_diff in diffs.items():
+            t_data_a = tables_a[table]
+            # Add missing columns
+            for col in t_diff.get("columns_only_in_a", []):
+                col_data = t_data_a["columns"][col]
+                null_str = "NULL" if col_data["nullable"] else "NOT NULL"
+                def_str = f" DEFAULT {col_data['default']}" if col_data["default"] is not None else ""
+                
+                alter_clause = ""
+                if db_type == "mssql":
+                    alter_clause = f"ADD {quote_ident(col)} {col_data['type']} {null_str}{def_str}"
+                elif db_type in ("mysql", "postgresql"):
+                    alter_clause = f"ADD COLUMN {quote_ident(col)} {col_data['type']} {null_str}{def_str}"
+                else:
+                    alter_clause = f"ADD COLUMN {quote_ident(col)} {col_data['type']} {null_str}{def_str}"
+                    
+                lines.append(f"ALTER TABLE {quote_ident(table)} {alter_clause};")
+                if db_type == "mssql":
+                    lines.append("GO")
+            
+            # Modify column types
+            for c_diff in t_diff.get("column_type_diffs", []):
+                col = c_diff["column"]
+                new_type = c_diff["a"]
+                
+                col_data = t_data_a["columns"][col]
+                null_str = "NULL" if col_data["nullable"] else "NOT NULL"
+                
+                if db_type == "mssql":
+                    lines.append(f"ALTER TABLE {quote_ident(table)} ALTER COLUMN {quote_ident(col)} {new_type} {null_str};")
+                    lines.append("GO")
+                elif db_type == "postgresql":
+                    lines.append(f"ALTER TABLE {quote_ident(table)} ALTER COLUMN {quote_ident(col)} TYPE {new_type};")
+                elif db_type == "mysql":
+                    lines.append(f"ALTER TABLE {quote_ident(table)} MODIFY COLUMN {quote_ident(col)} {new_type} {null_str};")
+                else:
+                    lines.append(f"-- sqlite does not support altering column types: table {table}, col {col} to {new_type}")
+            
+            # Modify nullability
+            for c_diff in t_diff.get("column_nullability_diffs", []):
+                col = c_diff["column"]
+                null_val = c_diff["a"]
+                col_data = t_data_a["columns"][col]
+                col_type = col_data["type"]
+                
+                if db_type == "mssql":
+                    lines.append(f"ALTER TABLE {quote_ident(table)} ALTER COLUMN {quote_ident(col)} {col_type} {null_val};")
+                    lines.append("GO")
+                elif db_type == "postgresql":
+                    alter_null = "DROP NOT NULL" if null_val == "NULL" else "SET NOT NULL"
+                    lines.append(f"ALTER TABLE {quote_ident(table)} ALTER COLUMN {quote_ident(col)} {alter_null};")
+                elif db_type == "mysql":
+                    lines.append(f"ALTER TABLE {quote_ident(table)} MODIFY COLUMN {quote_ident(col)} {col_type} {null_val};")
+            
+            lines.append("")
+
+    # 3. CREATE & REPLACE STORED PROCEDURES
+    if procs_only_a or proc_diffs:
+        lines.append("-- ---------------------------------------------------------------------------")
+        lines.append("-- 3. STORED PROCEDURES")
+        lines.append("-- ---------------------------------------------------------------------------")
+        
+        all_procs_to_sync = sorted(list(set(procs_only_a) | set(proc_diffs.keys())))
+        
+        for proc in all_procs_to_sync:
+            proc_code = procs_a[proc]
+            if not proc_code:
+                continue
+                
+            if db_type == "mssql":
+                lines.append(f"IF EXISTS (SELECT * FROM sys.objects WHERE type = 'P' AND name = '{proc}')")
+                lines.append(f"    DROP PROCEDURE {quote_ident(proc)};")
+                lines.append("GO")
+                lines.append(proc_code.strip())
+                lines.append("GO")
+            elif db_type == "mysql":
+                lines.append(f"DROP PROCEDURE IF EXISTS {quote_ident(proc)};")
+                lines.append("DELIMITER //")
+                lines.append(proc_code.strip())
+                lines.append("//")
+                lines.append("DELIMITER ;")
+            else:
+                lines.append(f"DROP PROCEDURE IF EXISTS {quote_ident(proc)};")
+                lines.append(proc_code.strip())
+                lines.append(";")
+            lines.append("")
+            
+    return "\n".join(lines)
+
 def compare_database_schemas(schema_a: str, schema_b: str, name_a: str = "Database A", name_b: str = "Database B") -> Dict[str, Any]:
     try:
-        tables_a = fetch_schema_from_connection(schema_a)
-        tables_b = fetch_schema_from_connection(schema_b)
+        schema_data_a = fetch_schema_from_connection(schema_a)
+        schema_data_b = fetch_schema_from_connection(schema_b)
+        
+        if "tables" in schema_data_a:
+            tables_a = schema_data_a["tables"]
+            procs_a = schema_data_a.get("procedures", {})
+        else:
+            tables_a = schema_data_a
+            procs_a = {}
+            
+        if "tables" in schema_data_b:
+            tables_b = schema_data_b["tables"]
+            procs_b = schema_data_b.get("procedures", {})
+        else:
+            tables_b = schema_data_b
+            procs_b = {}
     except Exception as e:
         return {
             "tables_only_in_a": [],
             "tables_only_in_b": [],
             "tables_in_both": [],
             "diffs": {},
+            "procedures_only_in_a": [],
+            "procedures_only_in_b": [],
+            "procedures_in_both": [],
+            "procedure_diffs": {},
             "markdown_report": f"⚠️ **Failed to connect or fetch schemas**: {str(e)}"
         }
         
@@ -1082,15 +1327,52 @@ def compare_database_schemas(schema_a: str, schema_b: str, name_a: str = "Databa
                 "pk_diff": pk_diff
             }
             
+    # Stored Procedures Comparison
+    procs_only_a = sorted(list(set(procs_a.keys()) - set(procs_b.keys())))
+    procs_only_b = sorted(list(set(procs_b.keys()) - set(procs_a.keys())))
+    shared_procs = sorted(list(set(procs_a.keys()) & set(procs_b.keys())))
+    
+    proc_diffs = {}
+    for proc in shared_procs:
+        def_a = procs_a[proc] or ""
+        def_b = procs_b[proc] or ""
+        if normalize_sql(def_a) != normalize_sql(def_b):
+            proc_diffs[proc] = {
+                "a": def_a,
+                "b": def_b
+            }
+            
     # Generate Markdown report
     markdown_report = generate_db_comparison_markdown(
         {
             "tables_only_in_a": tables_only_a,
             "tables_only_in_b": tables_only_b,
             "tables_in_both": shared_tables,
-            "diffs": diffs
+            "diffs": diffs,
+            "procedures_only_in_a": procs_only_a,
+            "procedures_only_in_b": procs_only_b,
+            "procedures_in_both": shared_procs,
+            "procedure_diffs": proc_diffs
         },
         name_a, name_b
+    )
+
+    db_type = "mssql"
+    if schema_b.startswith("sqlite"):
+        db_type = "sqlite"
+    elif "postgres" in schema_b:
+        db_type = "postgresql"
+    elif "mysql" in schema_b:
+        db_type = "mysql"
+
+    sync_script = generate_db_sync_script(
+        tables_a=tables_a,
+        tables_only_a=tables_only_a,
+        diffs=diffs,
+        procs_a=procs_a,
+        procs_only_a=procs_only_a,
+        proc_diffs=proc_diffs,
+        db_type=db_type
     )
     
     return {
@@ -1098,6 +1380,12 @@ def compare_database_schemas(schema_a: str, schema_b: str, name_a: str = "Databa
         "tables_only_in_b": tables_only_b,
         "tables_in_both": shared_tables,
         "diffs": diffs,
+        "procedures_only_in_a": procs_only_a,
+        "procedures_only_in_b": procs_only_b,
+        "procedures_in_both": shared_procs,
+        "procedure_diffs": proc_diffs,
+        "sync_script": sync_script,
+        "db_type": db_type,
         "markdown_report": markdown_report
     }
 
@@ -1112,10 +1400,28 @@ def generate_db_comparison_markdown(results: Dict[str, Any], name_a: str, name_b
     md.append(f"- **Tables Only in {name_a}**: {len(results['tables_only_in_a'])}")
     md.append(f"- **Tables Only in {name_b}**: {len(results['tables_only_in_b'])}")
     md.append(f"- **Tables with Schema Gaps**: {len(results['diffs'])}")
+    
+    if "procedures_in_both" in results:
+        md.append(f"- **Stored Procedures in {name_a}**: {len(results['procedures_only_in_a']) + len(results['procedures_in_both'])}")
+        md.append(f"- **Stored Procedures in {name_b}**: {len(results['procedures_only_in_b']) + len(results['procedures_in_both'])}")
+        md.append(f"- **Shared Stored Procedures**: {len(results['procedures_in_both'])}")
+        md.append(f"- **Procedures Only in {name_a}**: {len(results['procedures_only_in_a'])}")
+        md.append(f"- **Procedures Only in {name_b}**: {len(results['procedures_only_in_b'])}")
+        md.append(f"- **Procedures with Definition Gaps**: {len(results['procedure_diffs'])}")
     md.append("")
     
     md.append("## ⚠️ Identified Gaps")
-    if not results['tables_only_in_a'] and not results['tables_only_in_b'] and not results['diffs']:
+    
+    has_gaps = (
+        results['tables_only_in_a'] or 
+        results['tables_only_in_b'] or 
+        results['diffs'] or 
+        results.get('procedures_only_in_a') or 
+        results.get('procedures_only_in_b') or 
+        results.get('procedure_diffs')
+    )
+    
+    if not has_gaps:
         md.append("✅ **No structural differences found! Both database schemas are perfectly aligned.**")
         return "\n".join(md)
         
@@ -1163,4 +1469,83 @@ def generate_db_comparison_markdown(results: Dict[str, Any], name_a: str, name_b
                 
             md.append("")
             
+    if "procedures_only_in_a" in results and results["procedures_only_in_a"]:
+        md.append(f"### ⚙️ Stored Procedures only in {name_a}")
+        for p in results["procedures_only_in_a"]:
+            md.append(f"- `{p}`")
+        md.append("")
+        
+    if "procedures_only_in_b" in results and results["procedures_only_in_b"]:
+        md.append(f"### ⚙️ Stored Procedures only in {name_b}")
+        for p in results["procedures_only_in_b"]:
+            md.append(f"- `{p}`")
+        md.append("")
+        
+    if "procedure_diffs" in results and results["procedure_diffs"]:
+        md.append("### 🔄 Stored Procedure Code Gaps")
+        for proc in results["procedure_diffs"].keys():
+            md.append(f"#### Procedure: `{proc}`")
+            md.append("- ⚙️ Code definition mismatch. Details can be audited in the gap diffs.")
+            md.append("")
+            
     return "\n".join(md)
+
+def list_databases(db_type: str, host: str, port: Optional[int] = None, username: Optional[str] = None, password: Optional[str] = None) -> List[str]:
+    db_type = db_type.lower().strip()
+    if db_type == "mssql":
+        import pymssql
+        server = host
+        if port:
+            server = f"{host}:{port}"
+        try:
+            conn = pymssql.connect(
+                server=server,
+                user=username,
+                password=password,
+                database='master'
+            )
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sys.databases WHERE name NOT IN ('master', 'tempdb', 'model', 'msdb');")
+            dbs = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            return sorted(dbs)
+        except Exception as e:
+            raise Exception(f"SQL Server connection failure: {str(e)}")
+            
+    elif db_type in ("postgresql", "postgres"):
+        import psycopg2
+        try:
+            conn = psycopg2.connect(
+                host=host,
+                port=port or 5432,
+                user=username,
+                password=password,
+                database='postgres'
+            )
+            cursor = conn.cursor()
+            cursor.execute("SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres', 'template1');")
+            dbs = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            return sorted(dbs)
+        except Exception as e:
+            raise Exception(f"PostgreSQL connection failure: {str(e)}")
+            
+    elif db_type == "mysql":
+        import pymysql
+        try:
+            conn = pymysql.connect(
+                host=host,
+                port=port or 3306,
+                user=username,
+                password=password
+            )
+            cursor = conn.cursor()
+            cursor.execute("SHOW DATABASES;")
+            dbs = [row[0] for row in cursor.fetchall() if row[0] not in ('information_schema', 'mysql', 'performance_schema', 'sys')]
+            conn.close()
+            return sorted(dbs)
+        except Exception as e:
+            raise Exception(f"MySQL connection failure: {str(e)}")
+    else:
+        raise Exception(f"Unsupported database type for listing: {db_type}")
+
